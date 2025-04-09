@@ -1,0 +1,566 @@
+# Load necessary libraries
+packages <- c("tidyverse",
+              "caret",
+              "glmnet",
+              "boot",
+              "car",
+              "reshape2",
+              "glasso",
+              "corpcor",
+              "factoextra",
+              "MASS",
+              "stats",
+              "data.table",
+              "vars",
+              "pROC",
+              "xtable"
+)
+
+packages_to_install <- packages[!packages %in% installed.packages()[,"Package"]]
+
+if(length(packages_to_install)) install.packages(packages_to_install, repos = "https://cloud.r-project.org/")
+
+lapply(packages, require, character.only = TRUE)
+
+# Set working directory
+setwd()
+
+###--------------------------------------------------------------------------###
+#Read CSV file
+demographic <- read_csv("demographic.csv")
+diet <- read_csv("diet.csv")
+examination <- read_csv("examination.csv")
+labs <- read_csv("labs.csv")
+medications <- read_csv("medications.csv")
+questionnaire <- read_csv("questionnaire.csv")
+
+
+# Combine into a big df
+big_df <- demographic %>%
+  left_join(diet, by = "SEQN") %>%
+  left_join(examination, by = "SEQN") %>%
+  left_join(labs, by = "SEQN") %>%
+  left_join(medications, by = "SEQN") %>%
+  left_join(questionnaire, by = "SEQN")
+dim(big_df) 
+###-------------------------------------------------------------------------###
+# Preprocess data
+
+# Remove rows with missing values in 'MCQ160F' column
+big_df_clean <- big_df %>% filter(!is.na(MCQ160F))
+big_df_clean <- big_df_clean %>% filter(MCQ160F %in% c(1, 2))
+
+# Recode 'MCQ160F' (1 becomes 1, 2 becomes 0)
+big_df_clean <- big_df_clean %>%
+  mutate(MCQ160F = ifelse(MCQ160F == 2, 0, 1))
+
+# Remove columns with more than 40% missing values
+missing_pct <- colSums(is.na(big_df)) / nrow(big_df)
+big_df_clean <- big_df_clean[, missing_pct <= 0.40] 
+dim(big_df_clean) 
+
+# Median Imputation for simplicity
+big_df_clean <- big_df_clean %>%
+  mutate_if(is.numeric, ~ifelse(is.na(.), median(., na.rm = TRUE), .))
+sum(is.na(big_df_clean))  # Ensure no missing values
+
+non_numeric_cols <- big_df_clean %>%
+  dplyr::select(where(~!is.numeric(.))) %>%
+  colnames()
+print(non_numeric_cols)  # Print non-numeric column names
+
+dim(big_df_clean)
+
+# Keep only numeric columns
+big_df_clean <- big_df_clean %>% dplyr::select(where(is.numeric))
+
+dim(big_df_clean)
+any(is.na(big_df_clean)) #should be FALSE
+
+big_df_clean <- big_df_clean %>% dplyr::select(-SEQN)
+
+# Check for multicollinearity
+# Remove constant columns 
+big_df_clean <- big_df_clean[, apply(big_df_clean, 2, sd) != 0]
+cor_matrix <- cor(big_df_clean)
+
+plot_correlation_matrix <- function(cor_matrix) {
+  # Melt the correlation matrix into a data frame
+  cor_melted <- melt(cor_matrix)
+  
+  # Create the plot
+  ggplot(cor_melted, aes(Var1, Var2, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1, 1)) +
+    theme_minimal() +
+    theme(axis.text.x = element_blank(),  # Remove x-axis labels
+          axis.text.y = element_blank(),  # Remove y-axis labels
+          axis.ticks = element_blank()) +  # Remove axis ticks
+    labs(title = "Correlation Matrix", fill = "Correlation") +
+    coord_fixed()  # Ensure the tiles are square
+}
+
+plot_correlation_matrix(cor_matrix)
+
+# Find pairs of features with high correlation (above 0.8)
+highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.8)
+
+# Remove one of each pair of highly correlated features
+big_df_clean <- big_df_clean[, -highly_correlated]
+dim(big_df_clean)
+
+# Scale data (standardization)
+# Scale all numeric predictors EXCEPT MCQ160F (the outcome)
+big_df_clean <- big_df_clean %>%
+  mutate(across(
+    .cols = where(is.numeric) & !all_of("MCQ160F"),
+    .fns = ~ scale(.) %>% as.vector()
+  ))
+
+###---------------------------------------------------------------------------###
+
+# Stratified sampling
+
+# Outcome and predictor matrix
+y <- as.factor(big_df_clean$MCQ160F)
+X <- as.matrix(big_df_clean[, -which(names(big_df_clean) == "MCQ160F")])
+
+# Create stroke binary inline (MCQ160F 1 or 2)
+is_stroke <- big_df_clean$MCQ160F %in% c(1, 2)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Initialize
+n_folds <- 4
+fold_ids <- rep(NA, nrow(big_df_clean))
+
+# Combine stroke status with indices
+combined_idx <- 1:nrow(big_df_clean)
+combined_data <- data.frame(
+  idx = combined_idx,
+  stroke = is_stroke
+)
+
+# Shuffle combined data
+shuffled_data <- combined_data[sample(nrow(combined_data)),]
+
+# Create folds with stratified sampling (ensuring equal distribution of stroke and non-stroke)
+folds <- cut(seq_along(shuffled_data$idx), breaks = n_folds, labels = FALSE)
+fold_ids[shuffled_data$idx] <- folds
+
+###----------------------------------------------------------------------###
+# PENALTY REGRESSION 
+# Initialize lists to store results
+lasso_coefficients <- list()
+ridge_coefficients <- list()
+
+# Initialize variables for cross-validation results
+# Set a range for lambda to test in cross-validation
+lambda_grid <- 10^seq(-1, -2, length.out = 20)
+cv_errors <- numeric(length(lambda_grid))  # Store CV errors for each lambda
+
+# Perform cross-validation for LASSO using custom folds
+for (j in 1:length(lambda_grid)) {
+  lambda_val <- lambda_grid[j]
+  
+  fold_deviances <- numeric(n_folds)  # Store the deviance for each fold
+  
+  # Perform cross-validation across the custom folds
+  for (i in 1:n_folds) {
+    # Split data into training and testing sets based on fold_ids
+    train_idx <- which(fold_ids != i)  # Training set (all but the current fold)
+    test_idx <- which(fold_ids == i)   # Testing set (the current fold)
+    
+    # Subset the data for training and testing
+    X_train <- X[train_idx, ]
+    y_train <- y[train_idx]
+    X_test <- X[test_idx, ]
+    y_test <- y[test_idx]
+    
+    # Convert y_test to numeric (0 or 1)
+    y_test_numeric <- as.numeric(y_test) - 1
+    
+    # Fit Lasso model with the current lambda
+    lasso_model <- glmnet(X_train, y_train, alpha = 1, lambda = lambda_val, family = "binomial")
+    
+    # Get predictions on the test set
+    lasso_pred <- predict(lasso_model, X_test, type = "response")
+    
+    # Compute binomial deviance (log-likelihood)
+    deviance <- -2 * sum(dbinom(y_test_numeric, size = 1, prob = lasso_pred, log = TRUE))
+    
+    # Store deviance for the current fold
+    fold_deviances[i] <- deviance
+  }
+  
+  # Average deviance for this lambda over all folds
+  cv_errors[j] <- mean(fold_deviances)
+}
+
+# Plot cross-validation error vs. lambda
+# Create a data frame for plotting
+plot_data <- data.frame(lambda = lambda_grid, deviance = cv_errors)
+
+# Plot using ggplot2
+ggplot(plot_data, aes(x = lambda, y = deviance)) +
+  geom_line() + 
+  geom_point() +
+  scale_x_log10() +  # Log scale for lambda
+  labs(x = "Lambda", y = "Binomial Deviance", title = "Cross-validation: Lasso Logistic Regression") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+# Find the best lambda (the one with the smallest binomial deviance)
+best_lambda_index <- which.min(cv_errors)
+best_lambda <- lambda_grid[best_lambda_index]
+
+cat("Best lambda value based on binomial deviance:", best_lambda, "\n")
+
+# You can fit the final model with the best lambda if desired:
+final_lasso_model <- glmnet(X, y, alpha = 1, lambda = best_lambda, family = "binomial")
+
+# Extract coefficients from the fitted Lasso model
+coef_lasso <- coef(final_lasso_model)
+coef_df <- as.data.frame(as.matrix(coef_lasso))
+coef_df$variable <- rownames(coef_df)
+colnames(coef_df)[1] <- "coefficient"
+
+# Keep only non-zero coefficients (selected variables)
+selected_vars <- subset(coef_df, coefficient != 0)
+
+# View selected variables and their coefficients
+print(selected_vars)
+
+# Keep only non-zero coefficients (selected variables) and exclude the intercept
+selected_vars <- subset(coef_df, coefficient != 0 & variable != "(Intercept)")
+
+# View selected variables and their coefficients
+print(selected_vars)
+
+# Plot the non-zero coefficients
+ggplot(selected_vars, aes(x = reorder(variable, coefficient), y = coefficient)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "Non-zero Lasso Coefficients", x = "Variables", y = "Coefficient Value") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),  # Rotate x-axis labels
+        plot.margin = margin(1, 1, 2, 1, "cm"),  # Add more space on the bottom
+        aspect.ratio = 1/2)
+###---------------------------------------------------------------------------###
+# DESPARSIFIED LASSO
+# Convert y to numeric (binary 0/1) if it’s a factor
+y_numeric <- as.numeric(as.character(y))
+
+# Fit the final Lasso model (with selected lambda)
+final_lasso_model <- glmnet(X, y, alpha = 1, lambda = best_lambda, family = "binomial")
+
+# Predict probabilities
+pred_probs <- predict(final_lasso_model, X, type = "response")
+
+# Compute residuals (observed - predicted probabilities)
+lasso_residuals <- y_numeric - pred_probs
+
+# Select the non-zero coefficients
+selected_vars <- which(coef(final_lasso_model)[-1] != 0)
+X_selected <- X[, selected_vars, drop = FALSE]
+
+# Compute the diagonal matrix for the weights (pred_probs * (1 - pred_probs))
+weights_matrix <- diag(as.vector(pred_probs * (1 - pred_probs)))
+
+# Compute the Hessian inverse (covariance matrix of the coefficients)
+hessian_inv <- solve(t(X_selected) %*% weights_matrix %*% X_selected)
+
+# Compute residual variance for logistic regression
+sigma_hat_squared <- sum(lasso_residuals^2) / (nrow(X) - length(selected_vars))
+
+# Compute standard errors for the coefficients (diagonal of the covariance matrix)
+std_errors <- sqrt(diag(hessian_inv) * sigma_hat_squared)
+
+# Compute confidence intervals on the log-odds scale
+alpha <- 0.05
+z_value <- qnorm(1 - alpha / 2) 
+log_odds_coef <- coef(final_lasso_model)[selected_vars]  # Coefficients for selected variables
+
+# Standard errors on the log-odds scale (already computed)
+log_odds_std_errors <- std_errors
+
+# Confidence intervals on the log-odds scale (Wald test)
+lower_log_odds_ci <- log_odds_coef - z_value * log_odds_std_errors
+upper_log_odds_ci <- log_odds_coef + z_value * log_odds_std_errors
+
+# Check if the log-odds confidence interval contains zero (no effect)
+significant_log_odds <- (lower_log_odds_ci > 0 | upper_log_odds_ci < 0)
+
+# Create a data frame to store the coefficients, confidence intervals, and significance on the log-odds scale
+log_odds_coefficients <- data.frame(
+  Variable = colnames(X)[selected_vars],
+  LogOddsCoefficient = log_odds_coef,
+  StdError = log_odds_std_errors,
+  LowerLogOddsCI = lower_log_odds_ci,
+  UpperLogOddsCI = upper_log_odds_ci,
+  Significant = significant_log_odds
+)
+
+# Print the coefficients with confidence intervals and significance
+print(log_odds_coefficients)
+
+# Plot the coefficients with confidence intervals
+ggplot(log_odds_coefficients, aes(x = reorder(Variable, LogOddsCoefficient), y = LogOddsCoefficient)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_errorbar(aes(ymin = LowerLogOddsCI, ymax = UpperLogOddsCI), width = 0.2, color = "black") +
+  coord_flip() +  # Flip coordinates to make the plot horizontal
+  labs(title = "Log-Odds Coefficients with 95% Confidence Intervals", x = "", y = "Log-Odds Coefficient") +
+  theme(axis.ticks.y = element_blank())  # Remove ticks on y-axis
+
+###----------------------------------------------------------###
+# POST_SELECTION_INFERENCE
+selected_vars <- which(coef(final_lasso_model)[-1] != 0)  # exclude intercept
+X_selected <- X[, selected_vars, drop = FALSE]  # Subset the X matrix with selected variables
+
+# Fit the logistic regression model on selected variables
+final_model <- glm(y ~ X_selected, family = "binomial")
+
+# Define a function for bootstrapping the coefficients
+bootstrap_coefs <- function(data, indices) {
+  # Resample the data
+  boot_data <- data[indices, ]
+  X_bootstrap <- X[indices, selected_vars, drop = FALSE]
+  y_bootstrap <- y[indices]
+  
+  # Fit the logistic regression model on the bootstrap sample
+  boot_model <- glm(y_bootstrap ~ X_bootstrap, family = "binomial")
+  
+  # Return the coefficients of the model (excluding the intercept)
+  return(coef(boot_model)[-1])  # Exclude intercept
+}
+
+# Perform bootstrap (100 resamples)
+set.seed(123)
+boot_results <- boot(data = data.frame(X, y), statistic = bootstrap_coefs, R = 100)
+
+# Compute the bootstrap standard errors and confidence intervals
+boot_se <- apply(boot_results$t, 2, sd)  # Standard errors of coefficients
+boot_ci_lower <- apply(boot_results$t, 2, function(x) quantile(x, 0.025))  # 2.5% quantile
+boot_ci_upper <- apply(boot_results$t, 2, function(x) quantile(x, 0.975))  # 97.5% quantile
+# Check if the confidence interval contains zero (significant if it doesn't contain zero)
+significant <- (boot_ci_lower > 0 | boot_ci_upper < 0)
+
+# Combine the results into a data frame
+# Get coefficients from the refitted logistic regression model (excluding intercept)
+refit_coefs <- coef(final_model)[-1]  # matches the order of selected_vars
+
+# Combine the results into a data frame (replace Lasso coefficients with refitted ones)
+bootstrap_inference <- data.frame(
+  Variable = colnames(X)[selected_vars],
+  Coefficient = refit_coefs,
+  StdError = boot_se,
+  LowerCI = boot_ci_lower,
+  UpperCI = boot_ci_upper,
+  Significant = significant
+)
+
+
+# Get coefficients from the refitted logistic regression model (excluding intercept)
+refit_coefs <- coef(final_model)[-1]  # matches the order of selected_vars
+
+# Combine the results into a data frame (replace Lasso coefficients with refitted ones)
+bootstrap_inference <- data.frame(
+  Variable = colnames(X)[selected_vars],
+  Coefficient = refit_coefs,
+  StdError = boot_se,
+  LowerCI = boot_ci_lower,
+  UpperCI = boot_ci_upper,
+  Significant = significant
+)
+
+print(bootstrap_inference)
+
+# Plot using the refitted coefficients
+ggplot(bootstrap_inference, aes(x = reorder(Variable, Coefficient), y = Coefficient)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 0.2, color = "black") +
+  coord_flip() +
+  labs(title = "Post-Selection Inference for Logistic Regression Coefficients",
+       subtitle = "After Variable Selection via Lasso",
+       x = "", y = "Coefficient") +
+  theme_minimal() +
+  theme(axis.ticks.y = element_blank())
+
+# Round values for display
+bootstrap_inference_rounded <- bootstrap_inference
+bootstrap_inference_rounded[, 2:5] <- round(bootstrap_inference_rounded[, 2:5], 3)
+
+# Create LaTeX table
+xtable_obj <- xtable(bootstrap_inference_rounded, caption = "Post-Selection Inference Results (Bootstrap)")
+
+# Print LaTeX code
+print(xtable_obj, include.rownames = FALSE, booktabs = TRUE)
+
+###---------------------------------------------------------------------------###
+# FACTOR MODEL 
+
+# Filter stroke values
+big_df_new <- big_df_clean[big_df_clean$MCQ160F <= 10, ]
+
+# Stratified split: maintain the ratio of stroke (1) and no stroke (0)
+index <- createDataPartition(big_df_new$MCQ160F, p = 0.8, list = FALSE)
+train_data <- big_df_new[index, ]
+test_data <- big_df_new[-index, ]
+
+# ---- BALANCING ----
+# Oversample minority class (stroke = 1), undersample majority class (no stroke = 0)
+
+# Separate stroke and non-stroke
+stroke_cases <- train_data[train_data$MCQ160F == "1", ]
+no_stroke_cases <- train_data[train_data$MCQ160F == "0", ]
+
+# Oversample stroke: sample with replacement to match majority
+oversampled_stroke <- stroke_cases[sample(1:nrow(stroke_cases), nrow(no_stroke_cases), replace = TRUE), ]
+
+
+# Combine to form balanced training data
+balanced_train <- rbind(oversampled_stroke, no_stroke_cases)  # or use undersampled_no_stroke instead
+
+# Shuffle
+set.seed(123)
+balanced_train <- balanced_train[sample(1:nrow(balanced_train)), ]
+
+# Remove the target column for PCA
+numeric_train_data <- as.matrix(balanced_train[, !names(balanced_train) %in% c("MCQ160F")])
+
+# Perform PCA
+pca_result <- prcomp(numeric_train_data, center = TRUE, scale. = TRUE)
+pca_components <- as.data.frame(pca_result$x)
+
+# Target variable
+dependent_variable <- as.numeric(as.character(balanced_train$MCQ160F))
+
+# BIC Selection
+num_steps <- 15
+K_values <- unique(round(seq(1, ncol(pca_components), length.out = num_steps)))
+bic_values <- numeric(length(K_values))
+
+for (i in seq_along(K_values)) {
+  k <- K_values[i]
+  regression_data <- cbind(pca_components[, 1:k, drop = FALSE], MCQ160F = dependent_variable)
+  model <- lm(MCQ160F ~ ., data = regression_data)
+  bic_values[i] <- BIC(model)
+}
+
+# Optimal number of components
+optimal_K_bic <- K_values[which.min(bic_values)]
+cat("Optimal number of principal components (K) using BIC:", optimal_K_bic, "\n")
+
+# Screeplot
+screeplot(pca_result, type = "lines", main = "Screeplot of Principal Components")
+
+# BIC plot
+bic_df <- data.frame(K = K_values, BIC = bic_values)
+
+# ggplot version of the BIC plot
+ggplot(bic_df, aes(x = K, y = BIC)) +
+  geom_line(color = "blue") +
+  geom_point(color = "blue", size = 2) +
+  geom_vline(xintercept = optimal_K_bic, color = "red", linetype = "dashed", size = 1) +
+  labs(title = "BIC vs. Number of Principal Components",
+       x = "Number of Principal Components",
+       y = "BIC") +
+  theme_minimal()
+
+# Prepare PCA components for training
+K <- optimal_K_bic
+principal_components <- as.data.table(pca_result$x[, 1:K])
+linear_model <- lm(dependent_variable ~ ., data = principal_components)
+
+# Apply PCA to test data
+numeric_test_data <- as.matrix(test_data[, !names(test_data) %in% c("MCQ160F")])
+pca_test_result <- predict(pca_result, newdata = numeric_test_data)
+test_principal_components <- as.data.frame(pca_test_result[, 1:K])
+
+# Predict
+predictions <- predict(linear_model, newdata = test_principal_components)
+actual_values <- test_data$MCQ160F
+
+# Evaluation metrics
+mse <- mean((predictions - actual_values)^2)
+rmse <- sqrt(mse)
+cat("Mean Squared Error (MSE):", mse, "\n")
+cat("Root Mean Squared Error (RMSE):", rmse, "\n")
+
+# Round predictions to 0/1
+rounded_predictions <- ifelse(predictions > 0.5, "Have a stroke", "No stroke")
+actual_class <- ifelse(actual_values == 0, "No stroke", "Have a stroke")
+
+# Confusion Matrix
+conf_matrix <- table(Predicted = rounded_predictions, Actual = actual_class)
+conf_matrix_melted <- melt(conf_matrix)
+
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("Accuracy:", accuracy, "\n")
+
+ggplot(conf_matrix_melted, aes(x = Actual, y = Predicted, label = value)) +
+  geom_tile(color = "black", fill = "white", size = 1) + 
+  geom_text(color = "black", size = 6) +
+  theme_minimal() +
+  labs(title = "Confusion Matrix - PCA Prediction with oversampled stroke cases",
+       x = "Actual Values",
+       y = "Predicted Values") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+###---------------------------------------------------------------------------###
+# LOGISTIC REGRESSION PREDICTION
+significant_vars <- bootstrap_inference[bootstrap_inference$Significant == TRUE, "Variable"]
+selected_vars <- as.character(significant_vars)
+cat("Selected significant variables:", selected_vars, "\n")
+
+# Step 1: Train a Logistic Regression Model using selected variables
+train_data_selected <- train_data[, c("MCQ160F", selected_vars)]  # Assuming 'MCQ160F' is the binary outcome variable
+train_data_selected$MCQ160F <- as.factor(train_data_selected$MCQ160F)  # Ensure it's a factor (binary outcome)
+
+stroke_cases <- train_data_selected[train_data_selected$MCQ160F == "1", ]
+no_stroke_cases <- train_data_selected[train_data_selected$MCQ160F == "0", ]
+
+# Oversample stroke to match no stroke count
+oversampled_stroke <- stroke_cases[sample(1:nrow(stroke_cases), nrow(no_stroke_cases), replace = TRUE), ]
+
+# Combine to form balanced training set
+balanced_train_data <- rbind(no_stroke_cases, oversampled_stroke)
+balanced_train_data <- balanced_train_data[sample(1:nrow(balanced_train_data)), ]  # Shuffle
+
+# ----- STEP 2: Fit logistic regression model -----
+log_model <- glm(MCQ160F ~ ., data = balanced_train_data, family = binomial())
+
+# ----- STEP 3: Prepare test data -----
+test_data_selected <- test_data[, c("MCQ160F", selected_vars)]
+test_data_selected$MCQ160F <- as.factor(test_data_selected$MCQ160F)
+
+# ----- STEP 4: Make predictions -----
+pred_probabilities <- predict(log_model, newdata = test_data_selected, type = "response")
+predictions <- ifelse(pred_probabilities > 0.5, "Have a stroke", "No stroke")
+actual_values <- ifelse(test_data_selected$MCQ160F == 1, "Have a stroke", "No stroke")
+
+# ----- STEP 5: Evaluation metrics -----
+mse <- mean((as.numeric(predictions == "Have a stroke") - as.numeric(actual_values == "Have a stroke"))^2)
+rmse <- sqrt(mse)
+cat("Mean Squared Error (MSE):", mse, "\n")
+cat("Root Mean Squared Error (RMSE):", rmse, "\n")
+
+# ----- STEP 6: Confusion Matrix -----
+conf_matrix <- table(Predicted = predictions, Actual = actual_values)
+conf_matrix_melted <- reshape2::melt(conf_matrix)
+
+ggplot(conf_matrix_melted, aes(x = Actual, y = Predicted, label = value)) +
+  geom_tile(color = "black", fill = "white", size = 1) + 
+  geom_text(color = "black", size = 6) +
+  theme_minimal() +
+  labs(title = "Confusion Matrix - Logistic LASSO Prediction (Balanced)",
+       x = "Actual Values",
+       y = "Predicted Values") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ----- STEP 7: Accuracy -----
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+cat("Accuracy:", accuracy, "\n")
